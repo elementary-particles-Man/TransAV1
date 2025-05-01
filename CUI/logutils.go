@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt" // fmt パッケージをインポート
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -11,84 +11,102 @@ import (
 
 // --- グローバル変数 (ロギング関連) ---
 var (
-	logger      *log.Logger
-	debugLogger *log.Logger
+	logger      *log.Logger // 通常ログ用ロガー (標準出力 +/- ファイル)
+	debugLogger *log.Logger // デバッグログ用ロガー (デバッグモード時のみ有効)
+	logFile     *os.File    // ログファイルオブジェクト (ファイル出力時)
+	// debugMode   bool        // ★★★ 削除: main.go のグローバル変数 debugMode を直接参照する ★★★
 )
 
-// setupLogging: ロギングを設定
-// main 関数から必要な情報を引数として受け取る
-func setupLogging(destDir string, startTime time.Time, logToFile bool, debugMode bool) {
-	// 標準出力用ロガーとデバッグ用ロガーの初期化
-	stdLogger := log.New(os.Stdout, "", log.Ldate|log.Ltime)
+// setupLogging: ロギングシステムを初期化・設定する
+// destDir: ログファイルの出力先ディレクトリ (logToFile が true の場合)
+// startTime: プログラム開始時刻 (ログファイル名に使用)
+// logToFileFlag: ログをファイルにも書き出すかのフラグ (main から)
+// debugModeFlag: デバッグモードを有効にするかのフラグ (main から) -> ★★★ 引数名は残すが、グローバル変数 debugMode を直接使う ★★★
+func setupLogging(destDir string, startTime time.Time, logToFileFlag bool, debugModeFlag bool /* 引数名は残すが、内部では main.debugMode を参照 */) {
+	// main から受け取ったデバッグフラグを使用 (グローバル変数 main.debugMode)
+	// debugMode = debugModeFlag // ★★★ この行を削除 ★★★
 
-	// デバッグロガーはデフォルトでは破棄 (io.Discard)
-	debugLogger = log.New(io.Discard, "[DEBUG] ", log.Ldate|log.Ltime|log.Lshortfile)
-	if debugMode {
-		// デバッグモード有効なら標準出力に設定
-		debugLogger.SetOutput(os.Stdout)
-	}
-
+	// --- 標準ロガー (logger) の設定 ---
+	var logOutput io.Writer = os.Stdout
 	logFilePath := ""
-	// logToFile フラグが true の場合のみファイル出力設定を試みる
-	if logToFile {
-		// 出力ディレクトリの状態を確認
-		info, err := os.Stat(destDir)
-		if os.IsNotExist(err) {
-			log.Printf("警告: 出力ディレクトリ '%s' が存在しないため、ログファイルは作成されません。\n", destDir)
-		} else if err != nil {
-			log.Printf("警告: 出力ディレクトリ '%s' の状態確認エラー (%v)。ログファイルは作成されません。\n", destDir, err)
-		} else if !info.IsDir() {
-			log.Printf("警告: 出力パス '%s' はディレクトリではありません。ログファイルは作成されません。\n", destDir)
-		} else {
-			// ディレクトリが存在し、ディレクトリであることを確認
-			// 書き込み権限チェックのために一時ファイルを作成してみる
-			tempFile, err := os.CreateTemp(destDir, "logcheck_")
+
+	if logToFileFlag {
+		if checkLogDir(destDir) {
+			logFileName := fmt.Sprintf("GoTransAV1_Log_%s.log", startTime.Format("20060102_150405"))
+			logFilePath = filepath.Join(destDir, logFileName)
+			var err error
+			logFile, err = os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err != nil {
-				log.Printf("警告: 出力ディレクトリ '%s' に書き込めません (%v)。ログファイルは作成されません。\n", destDir, err)
+				log.Printf("警告: ログファイル '%s' を開けません (%v)。ログは標準出力にのみ出力されます。\n", logFilePath, err)
+				logFile = nil
 			} else {
-				// 書き込み可能なら一時ファイルを閉じて削除
-				tempFile.Close()
-				os.Remove(tempFile.Name())
-
-				// ログファイルパスを生成
-				logFileName := fmt.Sprintf("GoTransAV1_Log_%s.log", startTime.Format("20060102_150405"))
-				logFilePath = filepath.Join(destDir, logFileName)
+				logOutput = io.MultiWriter(os.Stdout, logFile)
+				log.Printf("ログを '%s' にも出力します。\n", logFilePath)
 			}
 		}
 	}
+	logger = log.New(logOutput, "", log.Ldate|log.Ltime)
 
-	// ログファイルパスが有効ならファイルを開いて MultiWriter を設定
-	if logFilePath != "" {
-		logFile, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Printf("警告: ログファイル '%s' を開けません (%v)。ログは標準出力にのみ出力されます。\n", logFilePath, err)
-			logger = stdLogger // ファイルが開けなければ標準ロガーを使用
-			// デバッグログは既に設定された出力先 (標準出力 or io.Discard) のまま
+	// --- デバッグロガー (debugLogger) の設定 ---
+	var debugOutput io.Writer = io.Discard
+	// ★★★ main.go のグローバル変数 debugMode を直接参照 ★★★
+	if debugMode {
+		if logFile != nil {
+			debugOutput = io.MultiWriter(os.Stdout, logFile)
 		} else {
-			// 標準出力とファイルの両方に出力
-			multiWriter := io.MultiWriter(os.Stdout, logFile)
-			logger = log.New(multiWriter, "", log.Ldate|log.Ltime)
-			log.Printf("ログを '%s' にも出力します。\n", logFilePath)
-			// デバッグログもファイルに出力する場合 (標準出力にも出る)
-			if debugMode {
-				debugMultiWriter := io.MultiWriter(os.Stdout, logFile)
-				debugLogger.SetOutput(debugMultiWriter)
-				debugLogger.SetFlags(log.Ldate | log.Ltime | log.Lshortfile) // フラグ再設定
-				debugLogger.SetPrefix("[DEBUG] ")                            // Prefix再設定
-			}
-			// 注意: logFile はプログラム終了まで閉じられない
-			// defer logFile.Close() は main の外なのでここでは呼べない
+			debugOutput = os.Stdout
 		}
-	} else {
-		// ログファイルが無効な場合は標準出力のみ
-		logger = stdLogger
-		// デバッグログは既に設定された出力先 (標準出力 or io.Discard) のまま
+	}
+	debugLogger = log.New(debugOutput, "[DEBUG] ", log.Ldate|log.Ltime|log.Lshortfile)
+
+	// --- 初期ログメッセージ ---
+	logger.Println("--- ロギング開始 ---")
+	// ★★★ main.go のグローバル変数 debugMode を直接参照 ★★★
+	if debugMode {
+		debugLogPrintf("デバッグモード有効")
+	}
+	if logFile != nil {
+		logger.Printf("ログファイル: %s", logFilePath)
 	}
 }
 
-// debugLogPrintf: デバッグログ出力関数 (debugMode が true の場合のみ出力)
+// checkLogDir: ログ出力先ディレクトリの存在と書き込み権限を確認する
+func checkLogDir(dirPath string) bool {
+	info, err := os.Stat(dirPath)
+	if os.IsNotExist(err) {
+		log.Printf("警告: ログ出力先ディレクトリ '%s' が存在しません。ログファイルは作成されません。\n", dirPath)
+		return false
+	}
+	if err != nil {
+		log.Printf("警告: ログ出力先ディレクトリ '%s' の状態確認エラー (%v)。ログファイルは作成されません。\n", dirPath, err)
+		return false
+	}
+	if !info.IsDir() {
+		log.Printf("警告: ログ出力先パス '%s' はディレクトリではありません。ログファイルは作成されません。\n", dirPath)
+		return false
+	}
+	tempFile, err := os.CreateTemp(dirPath, ".logcheck_")
+	if err != nil {
+		log.Printf("警告: ログ出力先ディレクトリ '%s' に書き込めません (%v)。ログファイルは作成されません。\n", dirPath, err)
+		return false
+	}
+	tempFile.Close()
+	os.Remove(tempFile.Name())
+	return true
+}
+
+// debugLogPrintf: デバッグログを出力するヘルパー関数
 func debugLogPrintf(format string, v ...interface{}) {
-	if debugMode && debugLogger != nil { // debugLogger が初期化されているか確認
-		debugLogger.Printf(format, v...)
+	// ★★★ main.go のグローバル変数 debugMode を直接参照 ★★★
+	if debugMode && debugLogger != nil {
+		debugLogger.Output(2, fmt.Sprintf(format, v...))
 	}
 }
+
+// closeLogFile: プログラム終了時にログファイルを閉じる (現在は未使用)
+// func closeLogFile() {
+// 	if logFile != nil {
+// 		logger.Println("--- ロギング終了 ---")
+// 		logFile.Close()
+// 	}
+// }

@@ -5,7 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	// "io" // io パッケージは使用しないため削除
+
+	// "io" // 不要
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,106 +16,117 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows" // Windows 特有の API 呼び出しに必要
 )
 
-// ffmpeg 実行結果構造体
+// ffmpegResult: ffmpeg の実行結果を格納する構造体
 type ffmpegResult struct {
-	err      error
-	timedOut bool
-	exitCode int
+	err      error // 発生したエラー
+	timedOut bool  // タイムアウトしたかどうか
+	exitCode int   // ffmpeg プロセスの終了コード (-1: 不明, -2: タイムアウト, -3: 実行時エラー)
 }
 
-// executeFFmpeg: ffmpegプロセスを実行し、結果を返す
-// encoderSpecificOptions: 各エンコーダ固有のオプション文字列 (-hwopt や -cpuopt の値)
-// ffmpegPriority は main.go から引数として受け取る
-// debugMode は logutils.go で定義されているが、同じパッケージなので直接参照可能
-// ffmpegPath は main.go で定義されたグローバル変数
+// executeFFmpeg: ffmpeg プロセスを実行し、結果を返す
+// ctx: タイムアウト制御のためのコンテキスト
+// inputPath: 入力ファイルパス
+// outputPath: 出力ファイルパス (QuickMode時は最終パス、TempMode時は一時パス)
+// tempDir: 一時ディレクトリパス (ログなど用、現在は未使用)
+// ffmpegPriority: プロセス優先度 (main.go で指定)
+// encoder: 使用するエンコーダ名 (例: "av1_nvenc", "libsvtav1")
+// encoderSpecificOptions: エンコーダ固有のオプション文字列 (例: "-cq 25 -preset p5")
 func executeFFmpeg(ctx context.Context, inputPath string, outputPath string, tempDir string, ffmpegPriority string, encoder string, encoderSpecificOptions string) ffmpegResult {
-	result := ffmpegResult{exitCode: -1} // 初期値
+	result := ffmpegResult{exitCode: -1} // 終了コードの初期値は不明(-1)
 
-	// main.go で設定されたグローバル変数 ffmpegPath を使用
+	// ffmpeg コマンドの基本パス (main.go で解決済み)
 	baseCmd := ffmpegPath
 
-	// ffmpeg に渡す引数リストを作成
+	// ffmpeg に渡す引数リストを構築
 	args := []string{
-		"-hide_banner", // バナー非表示
-		"-stats",       // 進捗状況表示を有効にする (表示されるかは別問題)
-		"-i", inputPath, // 入力ファイル
-		"-c:v", encoder, // 映像エンコーダ (hwenc または cpuenc)
-		"-c:a", "aac", // 音声エンコーダ
+		"-hide_banner",  // バナー情報を非表示に
+		"-nostats",      // 定期的な進捗状況の出力を抑制 (ログが見やすくなる)
+		"-i", inputPath, // 入力ファイル指定
+		"-c:v", encoder, // 映像エンコーダ指定
+		"-c:a", "aac", // 音声エンコーダは AAC に固定 (必要ならオプション化)
 		"-y", // 出力ファイルを常に上書き
-		// ここに追加オプションやログレベルが入る
+		// ここにエンコーダ固有オプション、ログレベルが追加される
 	}
 
-	// エンコーダ固有オプションを追加 (空文字列でなければ)
+	// エンコーダ固有オプションを追加 (スペースで分割して個別の引数にする)
 	if encoderSpecificOptions != "" {
+		// strings.Fields はスペース区切りの文字列をスライスに分割する
 		opts := strings.Fields(encoderSpecificOptions)
 		args = append(args, opts...)
+		debugLogPrintf("エンコーダ (%s) 固有オプション追加: %v", encoder, opts)
 	}
 
-	// logutils.go で設定された debugMode を使用
+	// ログレベルを設定 (-debug フラグに応じて変更)
 	if debugMode {
-		args = append(args, "-loglevel", "error") // デバッグ時は error
+		// デバッグモード時は詳細なエラー情報が見たいので 'error' レベル
+		args = append(args, "-loglevel", "error")
 	} else {
-		args = append(args, "-loglevel", "fatal") // 通常時は fatal レベル
+		// 通常時は致命的なエラーのみ表示する 'fatal' レベルでログを最小限に
+		args = append(args, "-loglevel", "fatal")
 	}
 
 	// 最後に出力ファイルパスを追加
 	args = append(args, outputPath)
 
-	// --- OS別 優先度/nice設定 ---
-	var finalArgs []string
-	var cmd *exec.Cmd
+	// --- OS 別の優先度設定とコマンド構築 ---
+	var finalArgs []string // 実際に exec に渡す引数リスト
+	var cmd *exec.Cmd      // 実行するコマンドオブジェクト
+
 	if runtime.GOOS == "windows" {
+		// Windows: ffmpeg を直接実行 (優先度は後で設定)
 		finalArgs = args
 		cmd = exec.CommandContext(ctx, baseCmd, finalArgs...)
+		debugLogPrintf("Windows コマンド準備: %s %v", baseCmd, finalArgs)
 	} else if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
-		// Unix (Linux/macOS) 用 nice 値設定
-		niceArgs, err := getUnixNiceArgs(ffmpegPriority) // この関数は ffmpeg.go に残す
+		// Unix (Linux/macOS): nice コマンド経由で優先度を設定
+		niceArgs, err := getUnixNiceArgs(ffmpegPriority) // nice コマンド引数を取得
 		if err != nil {
-			// logutils.go の logger を使用
-			logger.Printf("警告: Unix優先度設定エラー: %v。デフォルト優先度。", err)
+			// 優先度設定エラーは警告とし、nice なしで実行
+			logger.Printf("警告: Unix 優先度 '%s' の設定に失敗: %v。デフォルト優先度で実行します。", ffmpegPriority, err)
 			finalArgs = args
-			cmd = exec.CommandContext(ctx, baseCmd, finalArgs...) // nice なしで実行
+			cmd = exec.CommandContext(ctx, baseCmd, finalArgs...) // ffmpeg を直接実行
 		} else {
 			// nice コマンド経由で ffmpeg を実行
-			finalArgs = append(niceArgs, baseCmd) // nice -n X ffmpeg ...
+			// finalArgs = [ "nice", "-n", "10", "ffmpeg", "-i", ... ] のようになる
+			finalArgs = append(niceArgs, baseCmd) // nice -n X ffmpeg
 			finalArgs = append(finalArgs, args...)
+			// exec.CommandContext の第一引数は実行ファイルパス、第二引数以降がその引数
 			cmd = exec.CommandContext(ctx, finalArgs[0], finalArgs[1:]...) // finalArgs[0] は "nice"
-			// logutils.go の debugLogPrintf を使用
-			debugLogPrintf("Unix niceコマンドを使用して実行: %v", finalArgs)
+			debugLogPrintf("Unix nice コマンド準備: %v", finalArgs)
 		}
 	} else {
-		// logutils.go の logger を使用
-		logger.Printf("警告: 未対応OS (%s) のため、優先度設定はスキップされます。", runtime.GOOS)
+		// その他の OS: 優先度設定はスキップ
+		logger.Printf("警告: 未対応 OS (%s) のため、プロセス優先度設定はスキップされます。", runtime.GOOS)
 		finalArgs = args
 		cmd = exec.CommandContext(ctx, baseCmd, finalArgs...)
 	}
 
-	// --- 実行設定 ---
-	if cmd.SysProcAttr == nil { // Linux/macOS で nice を使う場合などに必要
+	// --- プロセス属性設定 ---
+	// SysProcAttr は OS 固有の設定を行うためのフィールド
+	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	// OS固有のSysProcAttr設定
-	setOSSpecificAttrs(cmd.SysProcAttr) // この関数は ffmpeg.go に残す (OS固有のシステムコール関連のため)
+	setOSSpecificAttrs(cmd.SysProcAttr) // OS 固有の属性を設定 (例: Windows でウィンドウ非表示)
 
-	// ffmpeg の標準出力/エラーをキャプチャするためのパイプ
+	// --- 標準エラー出力のパイプ設定 ---
+	// ffmpeg は進捗やエラーを標準エラー出力 (stderr) に出すことが多い
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		result.err = fmt.Errorf("ffmpeg (%s) stderr パイプ作成エラー: %w", encoder, err)
 		return result
 	}
-	stdoutPipe, err := cmd.StdoutPipe() // 標準出力も一応キャプチャ (loglevel fatal ならほぼ出ないはず)
+	// 標準出力 (stdout) も念のためキャプチャ (loglevel fatal ならほぼ出ないはず)
+	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		result.err = fmt.Errorf("ffmpeg (%s) stdout パイプ作成エラー: %w", encoder, err)
 		return result
 	}
 
-	// --- 実行開始 ---
-	// logutils.go の logger を使用
-	logger.Printf("ffmpeg 実行開始 (%s): %s -> %s", encoder, filepath.Base(inputPath), filepath.Base(outputPath))
-	// logutils.go の debugLogPrintf を使用
+	// --- ffmpeg プロセス実行開始 ---
+	logger.Printf("ffmpeg 実行開始 (%s): %s", encoder, filepath.Base(outputPath))              // 通常ログはシンプルに
 	debugLogPrintf("コマンド (%s): %s %s", encoder, cmd.Path, strings.Join(cmd.Args[1:], " ")) // デバッグ用にコマンド全体表示
 
 	if err := cmd.Start(); err != nil {
@@ -122,100 +134,118 @@ func executeFFmpeg(ctx context.Context, inputPath string, outputPath string, tem
 		return result
 	}
 
-	// --- Windows 優先度設定 (プロセス開始後) ---
+	// --- Windows プロセス優先度設定 (プロセス開始直後) ---
 	if runtime.GOOS == "windows" {
-		// 少し待ってから優先度を設定 (プロセス初期化のため)
-		// この待機時間は環境によって調整が必要な場合がある
+		// プロセスが完全に初期化されるのを少し待つ (環境依存の可能性あり)
 		time.Sleep(150 * time.Millisecond)
-		// Windows用プロセス優先度設定
-		if err := setWindowsPriorityAfterStart(cmd.Process, ffmpegPriority); err != nil { // この関数は ffmpeg.go に残す
-			// 優先度設定エラーは警告に留める (既に関数内でログ出力される)
-			// logger.Printf("警告: Windowsプロセス優先度設定失敗 (PID: %d): %v", cmd.Process.Pid, err)
+		// 優先度を設定
+		if err := setWindowsPriorityAfterStart(cmd.Process, ffmpegPriority); err != nil {
+			// 優先度設定失敗は警告ログのみ (setWindowsPriorityAfterStart 内でログ出力される)
 		}
 	}
 
-	// --- 出力監視 (非同期) ---
-	var ffmpegOutput strings.Builder
+	// --- 標準出力/エラー出力の非同期読み取り ---
+	var ffmpegOutput strings.Builder // ffmpeg の出力を貯めるバッファ
 	stderrScanner := bufio.NewScanner(stderrPipe)
 	stdoutScanner := bufio.NewScanner(stdoutPipe)
-	stderrChan := make(chan struct{}) // stderr 監視終了通知用
-	stdoutChan := make(chan struct{}) // stdout 監視終了通知用
+	stderrChan := make(chan struct{}) // stderr 読み取り完了通知用チャネル
+	stdoutChan := make(chan struct{}) // stdout 読み取り完了通知用チャネル
 
+	// stderr 読み取りゴルーチン
 	go func() {
 		defer close(stderrChan) // ゴルーチン終了時にチャネルを閉じる
 		for stderrScanner.Scan() {
 			line := stderrScanner.Text()
-			ffmpegOutput.WriteString(line + "\n")
-			// エラーを含む行、またはデバッグモードならログ出力
-			// より詳細なエラー判定が必要なら調整
-			// logutils.go の logger を使用
+			ffmpegOutput.WriteString(line + "\n") // バッファに追記
+			// デバッグモード時、またはエラーっぽい行のみログに出力
 			if debugMode || strings.Contains(strings.ToLower(line), "error") {
 				logger.Printf("ffmpeg stderr (%s): %s", encoder, line)
 			}
 		}
+		if err := stderrScanner.Err(); err != nil {
+			// スキャン中にエラーが発生した場合
+			logger.Printf("警告: ffmpeg (%s) stderr の読み取り中にエラー: %v", encoder, err)
+		}
 	}()
+
+	// stdout 読み取りゴルーチン
 	go func() {
 		defer close(stdoutChan) // ゴルーチン終了時にチャネルを閉じる
 		for stdoutScanner.Scan() {
 			line := stdoutScanner.Text()
-			ffmpegOutput.WriteString(line + "\n")
-			// デバッグモードなら標準出力もログ出力
-			// logutils.go の debugLogPrintf を使用
+			ffmpegOutput.WriteString(line + "\n") // バッファに追記
+			// 標準出力はデバッグモード時のみログに出力
 			if debugMode {
 				debugLogPrintf("ffmpeg stdout (%s): %s", encoder, line)
 			}
 		}
+		if err := stdoutScanner.Err(); err != nil {
+			// スキャン中にエラーが発生した場合
+			logger.Printf("警告: ffmpeg (%s) stdout の読み取り中にエラー: %v", encoder, err)
+		}
 	}()
 
 	// --- プロセス終了待機 ---
+	// cmd.Wait() はプロセスが終了するまでブロックする
 	err = cmd.Wait()
 
-	// --- 出力監視ゴルーチンの終了を待つ ---
+	// --- 出力読み取りゴルーチンの完全終了を待つ ---
+	// パイプが閉じられ、ゴルーチン内のループが終了し、チャネルが閉じられるのを待つ
 	<-stderrChan
 	<-stdoutChan
 
-	// --- 結果処理 ---
-	// コンテキストがキャンセルされたか（タイムアウト）
+	// --- 実行結果の判定 ---
+	// 1. タイムアウト (コンテキストキャンセル) を確認
 	if ctx.Err() == context.DeadlineExceeded {
-		result.err = fmt.Errorf("ffmpeg (%s) タイムアウト (%d秒)", encoder, timeoutSeconds) // main.go の timeoutSeconds を使用
+		result.err = fmt.Errorf("ffmpeg (%s) タイムアウト (%d秒経過)", encoder, timeoutSeconds) // main.go の timeoutSeconds を使用
 		result.timedOut = true
 		result.exitCode = -2 // タイムアウトを示す内部コード
-		// タイムアウト時にはプロセスが強制終了されているはずだが念のためKillを試みる
+		// 念のためプロセスを Kill (既に終了している可能性もある)
 		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
+			_ = cmd.Process.Kill() // エラーは無視
 		}
+		logger.Printf("エラー: %v", result.err) // タイムアウトはエラーとしてログ出力
 	} else if err != nil {
-		// Wait() がエラーを返した場合 (タイムアウト以外)
+		// 2. Wait() がタイムアウト以外のエラーを返した場合
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			// プロセスは終了したが、ゼロ以外のコードで終了
+			// プロセスは終了したが、ゼロ以外の終了コード
 			result.exitCode = exitErr.ExitCode()
-			// エラーメッセージに取得した出力を追加
-			result.err = fmt.Errorf("ffmpeg (%s) 失敗 (ExitCode: %d)。\n--- ffmpeg出力 ---\n%s\n--- 出力終了 ---", encoder, result.exitCode, strings.TrimSpace(ffmpegOutput.String()))
+			// エラーメッセージには終了コードと ffmpeg の出力を付与
+			errMsg := fmt.Sprintf("ffmpeg (%s) 失敗 (終了コード: %d)", encoder, result.exitCode)
+			outputStr := strings.TrimSpace(ffmpegOutput.String())
+			if outputStr != "" {
+				errMsg += fmt.Sprintf("\n--- ffmpeg 出力 ---\n%s\n--- 出力終了 ---", outputStr)
+			}
+			result.err = errors.New(errMsg)  // エラー内容をセット
+			logger.Printf("エラー: %s", errMsg) // エラーログを出力
 		} else {
-			// その他の実行時エラー (例: コマンドが見つからない、パイプエラーなど)
-			result.err = fmt.Errorf("ffmpeg (%s) 実行時エラー: %w。\n--- ffmpeg出力 ---\n%s\n--- 出力終了 ---", encoder, err, strings.TrimSpace(ffmpegOutput.String()))
+			// その他の実行時エラー (コマンドが見つからないなど)
 			result.exitCode = -3 // 実行時エラーを示す内部コード
+			result.err = fmt.Errorf("ffmpeg (%s) 実行時エラー: %w", encoder, err)
+			logger.Printf("エラー: %v", result.err) // エラーログを出力
 		}
 	} else {
-		// 正常終了 (ExitCode 0)
+		// 3. 正常終了 (err == nil)
 		result.exitCode = 0
-		// logutils.go の debugLogPrintf を使用
-		debugLogPrintf("ffmpeg (%s) 正常終了 (ExitCode: 0)", encoder)
+		debugLogPrintf("ffmpeg (%s) 正常終了 (終了コード: 0)", encoder)
 		// 正常終了時でも、デバッグモードなら出力をログに残す
-		if debugMode && ffmpegOutput.Len() > 0 { // main.go の debugMode を使用
-			debugLogPrintf("ffmpeg (%s) 正常終了時の出力:\n--- ffmpeg出力 ---\n%s\n--- 出力終了 ---", strings.TrimSpace(ffmpegOutput.String()))
+		outputStr := strings.TrimSpace(ffmpegOutput.String())
+		if debugMode && outputStr != "" {
+			debugLogPrintf("ffmpeg (%s) 正常終了時の出力:\n--- ffmpeg 出力 ---\n%s\n--- 出力終了 ---", encoder, outputStr)
 		}
 	}
 
 	return result
 }
 
-// Windows用プロセス優先度設定 (SetPriorityClass API 使用)
+// setWindowsPriorityAfterStart: Windows でプロセス開始後に優先度を設定する
 func setWindowsPriorityAfterStart(process *os.Process, priority string) error {
 	if process == nil {
 		return errors.New("プロセスが nil です")
 	}
+
+	// 文字列から Windows API の優先度定数に変換
 	var priorityClass uint32
 	switch strings.ToLower(priority) {
 	case "idle":
@@ -227,321 +257,274 @@ func setWindowsPriorityAfterStart(process *os.Process, priority string) error {
 	case "abovenormal":
 		priorityClass = windows.ABOVE_NORMAL_PRIORITY_CLASS
 	default:
-		return fmt.Errorf("無効なWindows優先度指定: %s (idle, BelowNormal, Normal, AboveNormal)", priority)
+		// 不明な優先度が指定された場合は警告ログを出して何もしない
+		logger.Printf("警告: 無効な Windows 優先度指定 '%s'。デフォルト優先度を維持します。", priority)
+		return nil // エラーとはしない
 	}
 
-	// logutils.go の debugLogPrintf を使用
-	debugLogPrintf("Windowsプロセス (PID: %d) の優先度を %s (0x%x) に設定試行...", process.Pid, priority, priorityClass)
+	debugLogPrintf("Windows プロセス (PID: %d) の優先度を %s (0x%x) に設定試行...", process.Pid, priority, priorityClass)
 
+	// プロセスハンドルを取得 (優先度設定に必要な権限を要求)
 	handle, err := windows.OpenProcess(windows.PROCESS_SET_INFORMATION, false, uint32(process.Pid))
 	if err != nil {
-		// エラーハンドリングを改善: アクセス権限がない場合などの情報をログに出力
 		errMsg := fmt.Sprintf("OpenProcess (PID: %d) 失敗: %v.", process.Pid, err)
 		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
-			errMsg += " プロセス優先度変更に必要な権限がない可能性があります。"
+			errMsg += " プロセス優先度変更に必要な権限がない可能性があります (管理者権限で実行が必要な場合があります)。"
 		}
-		// このエラーは警告に留め、処理は続行させることも検討できる
-		// return fmt.Errorf(errMsg)
-		// logutils.go の logger を使用
 		logger.Printf("警告: %s", errMsg) // 警告としてログ出力
 		return nil                      // エラーは返さない
 	}
-	defer windows.CloseHandle(handle)
+	defer windows.CloseHandle(handle) // ハンドルを確実に閉じる
 
-	// 優先度設定
+	// 優先度を設定
 	err = windows.SetPriorityClass(handle, priorityClass)
 	if err != nil {
-		// エラーハンドリングを改善
 		errMsg := fmt.Sprintf("SetPriorityClass (PID: %d, Priority: 0x%x) 失敗: %v.", process.Pid, priorityClass, err)
-		// このエラーも警告に留めることを検討
-		// return fmt.Errorf(errMsg)
-		// logutils.go の logger を使用
 		logger.Printf("警告: %s", errMsg) // 警告としてログ出力
 		return nil                      // エラーは返さない
 	}
 
-	// logutils.go の debugLogPrintf を使用
-	debugLogPrintf("Windowsプロセス (PID: %d) の優先度設定成功。", process.Pid)
+	debugLogPrintf("Windows プロセス (PID: %d) の優先度設定成功。", process.Pid)
 	return nil
 }
 
-// Unix (Linux/macOS) 用 nice 値設定
+// getUnixNiceArgs: Unix 系 OS で nice コマンドの引数を生成する
 func getUnixNiceArgs(priority string) ([]string, error) {
 	var niceValue int
 	switch strings.ToLower(priority) {
-	case "idle": // 最低
+	case "idle": // 最低優先度
 		niceValue = 19
 	case "belownormal":
 		niceValue = 10
 	case "normal":
 		niceValue = 0
-	case "abovenormal": // より高い優先度 (低いnice値)
-		niceValue = -5
-	// より高い値は root 権限が必要な場合が多い
+	case "abovenormal": // より高い優先度 (低い nice 値)
+		niceValue = -5 // 一般ユーザーで設定可能な範囲が多い (-20 まであるが root 権限が必要な場合あり)
 	default:
-		return nil, fmt.Errorf("無効なUnix優先度指定: %s (idle, BelowNormal, Normal, AboveNormal)", priority)
+		return nil, fmt.Errorf("無効な Unix 優先度指定: '%s' (idle, BelowNormal, Normal, AboveNormal のいずれか)", priority)
 	}
-	// nice コマンドの引数を返す
+	// nice コマンドとその引数を返す (例: ["nice", "-n", "10"])
 	return []string{"nice", "-n", strconv.Itoa(niceValue)}, nil
 }
 
-
-// OS固有のSysProcAttr設定
+// setOSSpecificAttrs: OS 固有のプロセス属性を設定する
 func setOSSpecificAttrs(attr *syscall.SysProcAttr) {
 	if runtime.GOOS == "windows" {
-		// Windowsでコンソールウィンドウを表示しない
+		// Windows で ffmpeg 実行時にコンソールウィンドウを表示しないようにする
 		attr.HideWindow = true
 	}
-	// Linux/macOS では通常不要
+	// Linux/macOS では通常、追加の属性設定は不要
 }
 
-
-// processVideoFile: 動画ファイルをAV1に変換する関数
-// main 関数から呼び出される
-// ffmpegPriority, hwEncoder, cpuEncoder, hwEncoderOptions, cpuEncoderOptions, timeoutSeconds, quickModeFlag は main.go から引数として受け取る
-// logger, debugLogPrintf は logutils.go から参照
-// fileExists, copyFileManually, handleProcessingFailure, createMarkerFile, outputSuffix は fileutils.go から参照
+// processVideoFile: 1つの動画ファイルを処理するメインロジック
+// inputFile: 入力動画ファイルのフルパス
+// outputFile: 出力動画ファイルのフルパス
+// tempDir: 一時ディレクトリのパス
+// ffmpegPriority, hwEncoder, cpuEncoder, hwEncoderOptions, cpuEncoderOptions, timeoutSeconds, quickModeFlag: main から渡される設定値
 func processVideoFile(inputFile string, outputFile string, tempDir string, ffmpegPriority string, hwEncoder string, cpuEncoder string, hwEncoderOptions string, cpuEncoderOptions string, timeoutSeconds int, quickModeFlag bool) error {
-	// logutils.go の logger を使用
-	logger.Printf("処理開始: %s", filepath.Base(inputFile))
+	logger.Printf("動画処理開始: %s", filepath.Base(inputFile))
 
-	// goto で飛び越えないように、markerPath, markerContent, markerSuffix をここで宣言
-	var markerPath string
-	var markerContent string
-	var markerSuffix string
-
-
-	// 出力ファイルが既に存在するかチェック
-	// fileutils.go の fileExists を使用
+	// --- 事前チェック ---
+	// 出力ファイルが既に存在するかチェック (fileutils.go)
 	if fileExists(outputFile) {
-		// logutils.go の logger を使用
-		logger.Printf("スキップ (既存): %s", filepath.Base(outputFile))
-		return nil // 正常終了として扱う
+		logger.Printf("スキップ (出力ファイル既存): %s", filepath.Base(outputFile))
+		return nil // 既に存在する場合は正常終了扱い
 	}
 
-	// 出力ディレクトリ作成 (MkdirAll は存在してもエラーにならない)
+	// 出力ディレクトリ作成 (fileutils.go)
 	outputDir := filepath.Dir(outputFile)
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		// 出力ディレクトリが作成できない場合は致命的エラー
 		return fmt.Errorf("出力ディレクトリ '%s' の作成エラー: %w", outputDir, err)
 	}
 
-	// タイムアウト設定
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
-	if timeoutSeconds <= 0 { // タイムアウト無効の場合
+	// --- タイムアウト用コンテキスト設定 ---
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if timeoutSeconds > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
+		debugLogPrintf("タイムアウト設定: %d 秒", timeoutSeconds)
+	} else {
+		// タイムアウト 0 または負数の場合はキャンセル可能なコンテキストのみ作成 (実質無制限)
 		ctx, cancel = context.WithCancel(context.Background())
+		debugLogPrintf("タイムアウト無効")
 	}
-	defer cancel() // 必ずキャンセルを呼び出す
+	defer cancel() // 関数終了時に必ずキャンセルを呼び出し、リソースを解放
 
-	// 一時ファイルパスの決定
-	tempOutputFileName := fmt.Sprintf("%s_%d%s",
-		strings.TrimSuffix(filepath.Base(inputFile), filepath.Ext(filepath.Base(inputFile))),
-		time.Now().UnixNano(), // ユニークな名前のためにナノ秒タイムスタンプを使用
-		outputSuffix) // fileutils.go の outputSuffix を使用
-	tempOutputPath := filepath.Join(tempDir, tempOutputFileName)
+	// --- 入力ファイルの準備 (Quick/Temp モード分岐) ---
+	var currentInputFile string  // ffmpeg に渡す実際の入力ファイルパス
+	var tempOutputPath string    // Temp モード時の一時出力ファイルパス
+	var renamedSourcePath string // Quick モード時のリネーム後ソースパス
 
-	var currentInputFile string
-	var renamedSourcePath string // Quickモードでソースをリネームした場合のパス
-
-	// Quickモードの場合、ソースファイルをリネームして直接エンコード
-	if quickModeFlag { // main.go の quickModeFlag を使用
-		// 元のファイル名に一時的なサフィックスを追加
-		renamedSourcePath = inputFile + ".processing"
-		// logutils.go の logger を使用
-		logger.Printf("Quick Mode: ソースファイルをリネームして直接エンコード: %s -> %s", filepath.Base(inputFile), filepath.Base(renamedSourcePath))
-
-		// リネーム実行
+	if quickModeFlag {
+		// === Quick モード ===
+		// ソースファイルをリネームして ffmpeg の入力とする
+		renamedSourcePath = inputFile + ".processing" // リネーム後のパス
+		logger.Printf("Quick Mode: ソースファイルを処理中名にリネーム: %s -> %s", filepath.Base(inputFile), filepath.Base(renamedSourcePath))
 		if err := os.Rename(inputFile, renamedSourcePath); err != nil {
-			// リネーム失敗は致命的
+			// リネーム失敗は致命的エラー
 			return fmt.Errorf("Quick Mode ソースファイルリネーム失敗 (%s -> %s): %w", inputFile, renamedSourcePath, err)
 		}
-		currentInputFile = renamedSourcePath // ffmpegへの入力はリネーム後のファイル
-		tempOutputPath = outputFile          // Quick Modeでは一時ファイルは使わず直接出力
-		// logutils.go の debugLogPrintf を使用
-		debugLogPrintf("Quick Mode: 一時出力パスを最終出力パスに設定: %s", tempOutputPath)
-
+		currentInputFile = renamedSourcePath // ffmpeg への入力はリネーム後のファイル
+		tempOutputPath = outputFile          // Quick Mode では一時出力ファイルは使わず、直接最終出力パスに出力
+		debugLogPrintf("Quick Mode: ffmpeg 入力: %s, ffmpeg 出力: %s", currentInputFile, tempOutputPath)
 	} else {
-		// Quickモードでない場合、一時ディレクトリにコピーしてエンコード
-		// logutils.go の logger を使用
-		logger.Printf("Temp Mode: 一時ディレクトリにコピーしてエンコード")
-		currentInputFile = filepath.Join(tempDir, filepath.Base(inputFile)) // 一時ディレクトリ内のファイル名
-		// logutils.go の debugLogPrintf を使用
-		debugLogPrintf("Temp Mode: 一時入力ファイルパス: %s", currentInputFile)
+		// === Temp モード (デフォルト) ===
+		// ソースファイルを一時ディレクトリにコピーして ffmpeg の入力とする
+		logger.Printf("Temp Mode: 一時ディレクトリにファイルをコピーします")
+		// 一時ディレクトリ内の入力ファイルパス
+		currentInputFile = filepath.Join(tempDir, filepath.Base(inputFile))
+		// 一時ディレクトリ内の一時出力ファイルパス (ユニークな名前を付与)
+		tempOutputFileName := fmt.Sprintf("%s_%d%s",
+			strings.TrimSuffix(filepath.Base(inputFile), filepath.Ext(filepath.Base(inputFile))),
+			time.Now().UnixNano(), // ナノ秒タイムスタンプで衝突回避
+			outputSuffix)          // fileutils.go の outputSuffix
+		tempOutputPath = filepath.Join(tempDir, tempOutputFileName)
+		debugLogPrintf("Temp Mode: ffmpeg 入力: %s, ffmpeg 出力: %s", currentInputFile, tempOutputPath)
 
-		// 元ファイルを一時ディレクトリにコピー
-		// logutils.go の logger を使用
+		// ファイルコピー実行 (fileutils.go)
 		logger.Printf("一時コピー中: %s -> %s", filepath.Base(inputFile), filepath.Base(currentInputFile))
-		// fileutils.go の copyFileManually を呼び出し
 		if err := copyFileManually(inputFile, currentInputFile); err != nil {
-			// コピー失敗時は一時ファイルを削除試行
+			// コピー失敗時は作成された可能性のある一時ファイルを削除試行
 			_ = os.Remove(currentInputFile)
 			return fmt.Errorf("一時コピー失敗 (%s -> %s): %w", inputFile, currentInputFile, err)
 		}
-		// logutils.go の debugLogPrintf を使用
 		debugLogPrintf("一時コピー完了: %s", currentInputFile)
 	}
 
-	// --- エンコード処理 ---
-	var result ffmpegResult
-	var usedEncoder string
-	var usedOptions string
+	// --- エンコード処理本体 ---
+	var result ffmpegResult // ffmpeg の実行結果
+	var usedEncoder string  // 実際に使用されたエンコーダ名 (ログ用)
+	var usedOptions string  // 実際に使用されたオプション (ログ用)
 
-	// 1. HWエンコーダを試行
-	if hwEncoder != "" { // main.go の hwEncoder を使用
-		// logutils.go の logger を使用
+	// 1. HW エンコーダ試行 (指定されている場合)
+	if hwEncoder != "" {
 		logger.Printf("HWエンコーダ (%s) で試行...", hwEncoder)
-		usedEncoder = hwEncoder // main.go の hwEncoder を使用
-		usedOptions = hwEncoderOptions // main.go の hwEncoderOptions を使用
-		// executeFFmpeg を呼び出し
+		usedEncoder = hwEncoder
+		usedOptions = hwEncoderOptions
 		result = executeFFmpeg(ctx, currentInputFile, tempOutputPath, tempDir, ffmpegPriority, usedEncoder, usedOptions)
 
 		if result.err == nil && result.exitCode == 0 {
-			// logutils.go の logger を使用
+			// HW エンコード成功
 			logger.Printf("HWエンコード成功 (%s)", hwEncoder)
-			goto encodeSuccess // 成功したら後処理へジャンプ
+			goto encodeSuccess // 成功時の後処理へ
 		}
 
-		// HWエンコード失敗時の処理
-		// logutils.go の logger を使用
+		// HW エンコード失敗
 		logger.Printf("HWエンコード失敗 (%s, ExitCode: %d, TimedOut: %t): %v", hwEncoder, result.exitCode, result.timedOut, result.err)
 
-		// タイムアウト以外の失敗、かつCPUエンコーダが指定されている場合、CPUエンコーダを試行
-		if !result.timedOut && cpuEncoder != "" { // main.go の cpuEncoder を使用
-			// logutils.go の logger を使用
-			logger.Printf("タイムアウトではない失敗のため、CPUエンコーダ (%s) で再試行...", cpuEncoder)
-			// コンテキストはそのまま使用（タイムアウト設定は維持される）
-			usedEncoder = cpuEncoder // main.go の cpuEncoder を使用
-			usedOptions = cpuEncoderOptions // main.go の cpuEncoderOptions を使用
-			// executeFFmpeg を呼び出し
+		// タイムアウト以外の失敗で、かつ CPU エンコーダが指定されている場合 -> CPU で再試行
+		if !result.timedOut && cpuEncoder != "" {
+			logger.Printf("CPUエンコーダ (%s) で再試行...", cpuEncoder)
+			// コンテキストはキャンセルされていないのでそのまま使用
+			usedEncoder = cpuEncoder
+			usedOptions = cpuEncoderOptions
 			result = executeFFmpeg(ctx, currentInputFile, tempOutputPath, tempDir, ffmpegPriority, usedEncoder, usedOptions)
 
 			if result.err == nil && result.exitCode == 0 {
-				// logutils.go の logger を使用
+				// CPU エンコード成功
 				logger.Printf("CPUエンコード成功 (%s)", cpuEncoder)
-				goto encodeSuccess // 成功したら後処理へジャンプ
+				goto encodeSuccess // 成功時の後処理へ
 			}
 
-			// CPUエンコードも失敗
-			// logutils.go の logger を使用
-			logger.Printf("CPUエンコード失敗 (%s, ExitCode: %d, TimedOut: %t): %v", cpuEncoder, result.exitCode, result.timedOut, result.err)
-			// 後処理に進む前に失敗を記録
-			goto encodeFailure
+			// CPU エンコードも失敗
+			logger.Printf("CPUエンコードも失敗 (%s, ExitCode: %d, TimedOut: %t): %v", cpuEncoder, result.exitCode, result.timedOut, result.err)
+			goto encodeFailure // 失敗時の後処理へ
 		} else if result.timedOut {
-			// HWエンコードがタイムアウトした場合、CPUエンコーダは試行しない（タイムアウトする可能性が高いため）
-			// logutils.go の logger を使用
-			logger.Printf("HWエンコードがタイムアウトしたため、CPUエンコーダでの再試行はスキップします。")
+			// HW がタイムアウトした場合、CPU での再試行はスキップ
+			logger.Printf("HWエンコードがタイムアウトしたため、CPUでの再試行はスキップします。")
 			goto encodeFailure
 		} else {
-			// HWエンコード失敗、かつCPUエンコーダが指定されていない場合
-			// logutils.go の logger を使用
+			// HW 失敗 & CPU 未指定の場合
 			logger.Printf("CPUエンコーダが指定されていないため、再試行はスキップします。")
 			goto encodeFailure
 		}
-	} else if cpuEncoder != "" { // main.go の cpuEncoder を使用
-		// HWエンコーダが指定されておらず、CPUエンコーダが指定されている場合
-		// logutils.go の logger を使用
-		logger.Printf("HWエンコーダが指定されていないため、CPUエンコーダ (%s) で試行...", cpuEncoder)
-		usedEncoder = cpuEncoder // main.go の cpuEncoder を使用
-		usedOptions = cpuEncoderOptions // main.go の cpuEncoderOptions を使用
-		// executeFFmpeg を呼び出し
+	} else if cpuEncoder != "" {
+		// 2. HW エンコーダ未指定 & CPU エンコーダ指定ありの場合
+		logger.Printf("CPUエンコーダ (%s) で試行...", cpuEncoder)
+		usedEncoder = cpuEncoder
+		usedOptions = cpuEncoderOptions
 		result = executeFFmpeg(ctx, currentInputFile, tempOutputPath, tempDir, ffmpegPriority, usedEncoder, usedOptions)
 
 		if result.err == nil && result.exitCode == 0 {
-			// logutils.go の logger を使用
+			// CPU エンコード成功
 			logger.Printf("CPUエンコード成功 (%s)", cpuEncoder)
-			goto encodeSuccess // 成功したら後処理へジャンプ
+			goto encodeSuccess // 成功時の後処理へ
 		}
 
-		// CPUエンコード失敗
-		// logutils.go の logger を使用
+		// CPU エンコード失敗
 		logger.Printf("CPUエンコード失敗 (%s, ExitCode: %d, TimedOut: %t): %v", cpuEncoder, result.exitCode, result.timedOut, result.err)
-		goto encodeFailure
+		goto encodeFailure // 失敗時の後処理へ
 
 	} else {
-		// どちらのエンコーダも指定されていない場合
+		// 3. HW も CPU も未指定の場合 (通常 main でチェックされるはずだが念のため)
 		return fmt.Errorf("エンコーダ (-hwenc または -cpuenc) が指定されていません。")
 	}
 
-encodeFailure:
-	// エンコード失敗時の処理
-	// マーカーファイルを作成
-	markerContent = fmt.Sprintf("Encoder: %s, Options: \"%s\", ExitCode: %d, TimedOut: %t, Error: %v", usedEncoder, usedOptions, result.exitCode, result.timedOut, result.err)
-	markerSuffix = ".error"
-	if result.timedOut {
-		markerSuffix = ".timeout"
-	} else if result.exitCode != 0 {
-		markerSuffix = ".failed"
+encodeFailure: // --- エンコード失敗時の後処理 ---
+	{ // goto ラベルと変数宣言スコープのためのブロック
+		// マーカーファイルを作成 (fileutils.go)
+		markerContent := fmt.Sprintf("Encoder: %s, Options: \"%s\", ExitCode: %d, TimedOut: %t, Error: %v", usedEncoder, usedOptions, result.exitCode, result.timedOut, result.err)
+		markerSuffix := ".error" // デフォルト
+		if result.timedOut {
+			markerSuffix = ".timeout"
+		} else if result.exitCode != 0 && result.exitCode != -1 && result.exitCode != -2 && result.exitCode != -3 {
+			// ffmpeg が明確なエラーコードで終了した場合
+			markerSuffix = fmt.Sprintf(".failed_%d", result.exitCode)
+		} else if result.exitCode != 0 {
+			// その他の失敗 (タイムアウト含む)
+			markerSuffix = ".failed"
+		}
+		markerPath := outputFile + markerSuffix // 最終出力ファイルパスにサフィックスを追加
+		createMarkerFile(markerPath, markerContent)
+
+		// 失敗時のクリーンアップ処理 (fileutils.go)
+		// QuickMode かどうかで処理内容が変わる
+		return handleProcessingFailure(inputFile, outputFile, result, quickModeFlag, renamedSourcePath, tempOutputPath)
 	}
-	// マーカーファイルパスは出力ファイルパスにサフィックスを追加
-	markerPath = outputFile + markerSuffix // ここで markerPath に値を代入
-	// fileutils.go の createMarkerFile を呼び出し
-	createMarkerFile(markerPath, markerContent)
 
-	// 失敗ハンドラを呼び出し、一時ファイルやリネームしたソースを処理
-	// Quickモードの場合は renamedSourcePath を渡し、Tempモードの場合は tempOutputPath を渡す
-	// fileutils.go の handleProcessingFailure を呼び出し
-	return handleProcessingFailure(inputFile, outputFile, result, quickModeFlag, renamedSourcePath, tempOutputPath)
+encodeSuccess: // --- エンコード成功時の後処理 ---
+	logger.Printf("エンコード成功: %s", filepath.Base(outputFile)) // 最終出力ファイル名でログ表示
 
-
-encodeSuccess:
-	// エンコード成功時の処理
-	// logutils.go の logger を使用
-	logger.Printf("エンコード成功: %s", filepath.Base(tempOutputPath))
-
-	// Quickモードでない場合、一時ファイルを最終出力先に移動
-	if !quickModeFlag { // main.go の quickModeFlag を使用
-		// logutils.go の debugLogPrintf を使用
+	if !quickModeFlag {
+		// === Temp モード成功時 ===
+		// 一時出力ファイルを最終出力先に移動 (リネーム)
 		debugLogPrintf("Temp Mode: 一時ファイルを最終出力先に移動: %s -> %s", tempOutputPath, outputFile)
-		// 最終出力先にファイルが存在しないことを再確認（念のため）
-		// fileutils.go の fileExists を使用
-		if fileExists(outputFile) {
-			// logutils.go の logger を使用
-			logger.Printf("警告: 移動先 '%s' にファイルが既に存在します。一時ファイルは削除されます。", outputFile)
-			// 一時ファイルを削除して終了
-			if err := os.Remove(tempOutputPath); err != nil {
-				// logutils.go の logger を使用
-				logger.Printf("警告: 成功後の一時ファイル削除失敗 (%s): %v", tempOutputPath, err)
-			}
-			// Quickモードでない場合の元のファイルはそのまま残る
-			return nil // 成功として終了
-		} else if _, err := os.Stat(outputFile); !os.IsNotExist(err) {
-			// Statで "存在しない" 以外のエラーが発生した場合
-			// 一時ファイルを削除してエラーを返す
-			if err := os.Remove(tempOutputPath); err != nil {
-				// logutils.go の logger を使用
-				logger.Printf("警告: 成功後の一時ファイル削除失敗 (%s): %v", tempOutputPath, err)
-			}
-			return fmt.Errorf("最終出力先 '%s' の確認エラー: %w", outputFile, err)
+		// 移動先にファイルが存在しないことを確認 (念のため)
+		if _, err := os.Stat(outputFile); !os.IsNotExist(err) {
+			// 存在する場合 (通常ありえないはずだが)、一時ファイルを削除して警告
+			logger.Printf("警告: 移動先 '%s' にファイルが既に存在します。一時ファイル '%s' は削除されます。", outputFile, tempOutputPath)
+			_ = os.Remove(tempOutputPath) // エラーは無視
+			return nil                    // 成功として終了 (既存ファイルを上書きしない)
 		}
 
-		// 移動実行
+		// リネーム実行
 		if err := os.Rename(tempOutputPath, outputFile); err != nil {
-			// 移動失敗時は、一時ファイルを削除試行
-			_ = os.Remove(tempOutputPath)
-			// 最終出力先も削除試行（部分的に作成された可能性）
-			_ = os.Remove(outputFile)
+			// リネーム失敗時のリカバリ試行
+			_ = os.Remove(tempOutputPath) // 一時ファイルを削除
+			_ = os.Remove(outputFile)     // 作成された可能性のある最終ファイルを削除
+			// 失敗をエラーとして返す
 			return fmt.Errorf("一時ファイル移動失敗 (%s -> %s): %w", tempOutputPath, outputFile, err)
 		}
-		// logutils.go の logger を使用
 		logger.Printf("ファイル移動完了: %s", filepath.Base(outputFile))
 
-		// 元の入力ファイルはそのまま残る（Temp Mode）
+		// Temp モードでは、一時ディレクトリにコピーした入力ファイル (currentInputFile) は
+		// defer で一時ディレクトリごと削除される。元の入力ファイル (inputFile) はそのまま残る。
 
 	} else {
-		// Quickモードの場合、リネームしたソースファイルを元の名前に戻す
-		// logutils.go の debugLogPrintf を使用
-		debugLogPrintf("Quick Mode: リネームしたソースを元に戻します: %s -> %s", renamedSourcePath, inputFile)
+		// === Quick モード成功時 ===
+		// リネームしていたソースファイルを元の名前に戻す
+		debugLogPrintf("Quick Mode: 処理中ファイル名を元に戻します: %s -> %s", renamedSourcePath, inputFile)
 		if err := os.Rename(renamedSourcePath, inputFile); err != nil {
-			// リネームバック失敗は警告に留める
-			// logutils.go の logger を使用
+			// リネームバック失敗は警告ログに留める
 			logger.Printf("警告 [Quick Mode]: ソースのリネームバック失敗 (%s -> %s): %v", renamedSourcePath, inputFile, err)
-			// logutils.go の logger を使用
 			logger.Printf("  手動で '%s' を '%s' に戻してください。", renamedSourcePath, inputFile)
+			// 処理自体は成功しているのでエラーは返さない
 		}
-		// Quickモードでは tempOutputPath は outputFile なので、移動は不要（既にffmpegが出力している）
-		// 成功時は一時ファイル (tempOutputPath) は存在しない
+		// Quick モードでは ffmpeg が直接 outputFile に出力しているので、移動は不要。
 	}
 
-	// logutils.go の logger を使用
-	logger.Printf("処理完了: %s", filepath.Base(outputFile))
-	return nil // 正常終了
+	// 正常終了
+	logger.Printf("動画処理完了: %s", filepath.Base(outputFile))
+	return nil
 }
