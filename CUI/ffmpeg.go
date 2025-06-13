@@ -5,8 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-
-	// "io" // 不要
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,6 +58,7 @@ func executeFFmpeg(ctx context.Context, inputPath string, outputPath string, tem
 	}
 
 	// ログレベルを設定 (-debug フラグに応じて変更)
+	// main.go の debugMode を直接参照 (logutils.go と同様)
 	if debugMode {
 		// デバッグモード時は詳細なエラー情報が見たいので 'error' レベル
 		args = append(args, "-loglevel", "error")
@@ -137,7 +136,7 @@ func executeFFmpeg(ctx context.Context, inputPath string, outputPath string, tem
 	// --- Windows プロセス優先度設定 (プロセス開始直後) ---
 	if runtime.GOOS == "windows" {
 		// プロセスが完全に初期化されるのを少し待つ (環境依存の可能性あり)
-		time.Sleep(150 * time.Millisecond)
+		// time.Sleep(150 * time.Millisecond) // 削除: setWindowsPriorityAfterStart内でリトライを検討する方が良い
 		// 優先度を設定
 		if err := setWindowsPriorityAfterStart(cmd.Process, ffmpegPriority); err != nil {
 			// 優先度設定失敗は警告ログのみ (setWindowsPriorityAfterStart 内でログ出力される)
@@ -158,6 +157,7 @@ func executeFFmpeg(ctx context.Context, inputPath string, outputPath string, tem
 			line := stderrScanner.Text()
 			ffmpegOutput.WriteString(line + "\n") // バッファに追記
 			// デバッグモード時、またはエラーっぽい行のみログに出力
+			// main.go の debugMode を直接参照
 			if debugMode || strings.Contains(strings.ToLower(line), "error") {
 				logger.Printf("ffmpeg stderr (%s): %s", encoder, line)
 			}
@@ -175,6 +175,7 @@ func executeFFmpeg(ctx context.Context, inputPath string, outputPath string, tem
 			line := stdoutScanner.Text()
 			ffmpegOutput.WriteString(line + "\n") // バッファに追記
 			// 標準出力はデバッグモード時のみログに出力
+			// main.go の debugMode を直接参照
 			if debugMode {
 				debugLogPrintf("ffmpeg stdout (%s): %s", encoder, line)
 			}
@@ -231,6 +232,7 @@ func executeFFmpeg(ctx context.Context, inputPath string, outputPath string, tem
 		debugLogPrintf("ffmpeg (%s) 正常終了 (終了コード: 0)", encoder)
 		// 正常終了時でも、デバッグモードなら出力をログに残す
 		outputStr := strings.TrimSpace(ffmpegOutput.String())
+		// main.go の debugMode を直接参照
 		if debugMode && outputStr != "" {
 			debugLogPrintf("ffmpeg (%s) 正常終了時の出力:\n--- ffmpeg 出力 ---\n%s\n--- 出力終了 ---", encoder, outputStr)
 		}
@@ -240,12 +242,13 @@ func executeFFmpeg(ctx context.Context, inputPath string, outputPath string, tem
 }
 
 // setWindowsPriorityAfterStart: Windows でプロセス開始後に優先度を設定する
+// 失敗時は警告ログを出力し、エラーは返さない（ベストエフォート）
+// time.Sleep を削除し、OpenProcess のリトライを試みる（より堅牢）
 func setWindowsPriorityAfterStart(process *os.Process, priority string) error {
 	if process == nil {
-		return errors.New("プロセスが nil です")
+		return errors.New("プロセスが nil です") // これは呼び出し元の問題なのでエラーを返す
 	}
 
-	// 文字列から Windows API の優先度定数に変換
 	var priorityClass uint32
 	switch strings.ToLower(priority) {
 	case "idle":
@@ -257,17 +260,37 @@ func setWindowsPriorityAfterStart(process *os.Process, priority string) error {
 	case "abovenormal":
 		priorityClass = windows.ABOVE_NORMAL_PRIORITY_CLASS
 	default:
-		// 不明な優先度が指定された場合は警告ログを出して何もしない
 		logger.Printf("警告: 無効な Windows 優先度指定 '%s'。デフォルト優先度を維持します。", priority)
 		return nil // エラーとはしない
 	}
 
 	debugLogPrintf("Windows プロセス (PID: %d) の優先度を %s (0x%x) に設定試行...", process.Pid, priority, priorityClass)
 
-	// プロセスハンドルを取得 (優先度設定に必要な権限を要求)
-	handle, err := windows.OpenProcess(windows.PROCESS_SET_INFORMATION, false, uint32(process.Pid))
+	var handle windows.Handle
+	var err error
+	const maxRetries = 3
+	const retryDelay = 100 * time.Millisecond
+
+	// OpenProcess をリトライ (プロセス初期化待ちのため)
+	for i := 0; i < maxRetries; i++ {
+		// プロセスハンドルを取得 (優先度設定に必要な権限を要求)
+		handle, err = windows.OpenProcess(windows.PROCESS_SET_INFORMATION, false, uint32(process.Pid))
+		if err == nil {
+			break // 成功したらループを抜ける
+		}
+		// アクセス拒否などの特定のエラーの場合のみリトライ
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_INVALID_PARAMETER) { // ERROR_INVALID_PARAMETER も初期化中に出ることがある
+			debugLogPrintf("OpenProcess 試行 %d/%d 失敗 (PID: %d): %v。%v 後にリトライします。", i+1, maxRetries, process.Pid, err, retryDelay)
+			time.Sleep(retryDelay)
+		} else {
+			// その他のエラーはリトライしない
+			break
+		}
+	}
+
+	// リトライしても OpenProcess が失敗した場合
 	if err != nil {
-		errMsg := fmt.Sprintf("OpenProcess (PID: %d) 失敗: %v.", process.Pid, err)
+		errMsg := fmt.Sprintf("OpenProcess (PID: %d) 失敗 (リトライ後): %v.", process.Pid, err)
 		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
 			errMsg += " プロセス優先度変更に必要な権限がない可能性があります (管理者権限で実行が必要な場合があります)。"
 		}
@@ -319,9 +342,10 @@ func setOSSpecificAttrs(attr *syscall.SysProcAttr) {
 // processVideoFile: 1つの動画ファイルを処理するメインロジック
 // inputFile: 入力動画ファイルのフルパス
 // outputFile: 出力動画ファイルのフルパス
+// outputDir: 出力先ディレクトリのパス (QuickModeマーカー作成用)
 // tempDir: 一時ディレクトリのパス
 // ffmpegPriority, hwEncoder, cpuEncoder, hwEncoderOptions, cpuEncoderOptions, timeoutSeconds, quickModeFlag: main から渡される設定値
-func processVideoFile(inputFile string, outputFile string, tempDir string, ffmpegPriority string, hwEncoder string, cpuEncoder string, hwEncoderOptions string, cpuEncoderOptions string, timeoutSeconds int, quickModeFlag bool) error {
+func processVideoFile(inputFile string, outputFile string, outputDir string, tempDir string, ffmpegPriority string, hwEncoder string, cpuEncoder string, hwEncoderOptions string, cpuEncoderOptions string, timeoutSeconds int, quickModeFlag bool) error {
 	logger.Printf("動画処理開始: %s", filepath.Base(inputFile))
 
 	// --- 事前チェック ---
@@ -331,8 +355,8 @@ func processVideoFile(inputFile string, outputFile string, tempDir string, ffmpe
 		return nil // 既に存在する場合は正常終了扱い
 	}
 
-	// 出力ディレクトリ作成 (fileutils.go)
-	outputDir := filepath.Dir(outputFile)
+	// 出力ディレクトリ作成 (fileutils.go) - MkdirAll は存在してもエラーにならない
+	// outputDir は main から渡されるようになった
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		// 出力ディレクトリが作成できない場合は致命的エラー
 		return fmt.Errorf("出力ディレクトリ '%s' の作成エラー: %w", outputDir, err)
@@ -352,17 +376,35 @@ func processVideoFile(inputFile string, outputFile string, tempDir string, ffmpe
 	defer cancel() // 関数終了時に必ずキャンセルを呼び出し、リソースを解放
 
 	// --- 入力ファイルの準備 (Quick/Temp モード分岐) ---
-	var currentInputFile string  // ffmpeg に渡す実際の入力ファイルパス
-	var tempOutputPath string    // Temp モード時の一時出力ファイルパス
-	var renamedSourcePath string // Quick モード時のリネーム後ソースパス
+	var currentInputFile string      // ffmpeg に渡す実際の入力ファイルパス
+	var tempOutputPath string        // Temp モード時の一時出力ファイルパス
+	var renamedSourcePath string     // Quick モード時のリネーム後ソースパス
+	var quickModeOriginMarker string // Quick モード時の .origin マーカーファイルパス
 
 	if quickModeFlag {
 		// === Quick モード ===
-		// ソースファイルをリネームして ffmpeg の入力とする
+		// 1. .origin マーカーファイルを作成 (出力先ディレクトリに)
+		quickModeOriginMarker = filepath.Join(outputDir, filepath.Base(inputFile)+originSuffix)
+		debugLogPrintf("Quick Mode: .origin マーカー作成試行: %s", quickModeOriginMarker)
+		markerFile, err := os.Create(quickModeOriginMarker)
+		if err != nil {
+			// マーカー作成失敗は警告に留めるが、回復処理は機能しない可能性がある
+			logger.Printf("警告 [Quick Mode]: .origin マーカー作成失敗 (%s): %v。回復処理が機能しない可能性があります。", quickModeOriginMarker, err)
+			quickModeOriginMarker = "" // マーカーパスをクリア
+		} else {
+			markerFile.Close() // 0バイトファイルなので即クローズ
+			debugLogPrintf("Quick Mode: .origin マーカー作成成功")
+		}
+
+		// 2. ソースファイルをリネームして ffmpeg の入力とする
 		renamedSourcePath = inputFile + ".processing" // リネーム後のパス
 		logger.Printf("Quick Mode: ソースファイルを処理中名にリネーム: %s -> %s", filepath.Base(inputFile), filepath.Base(renamedSourcePath))
 		if err := os.Rename(inputFile, renamedSourcePath); err != nil {
 			// リネーム失敗は致命的エラー
+			// 作成したマーカーファイルがあれば削除する
+			if quickModeOriginMarker != "" {
+				_ = os.Remove(quickModeOriginMarker)
+			}
 			return fmt.Errorf("Quick Mode ソースファイルリネーム失敗 (%s -> %s): %w", inputFile, renamedSourcePath, err)
 		}
 		currentInputFile = renamedSourcePath // ffmpeg への入力はリネーム後のファイル
@@ -458,6 +500,10 @@ func processVideoFile(inputFile string, outputFile string, tempDir string, ffmpe
 
 	} else {
 		// 3. HW も CPU も未指定の場合 (通常 main でチェックされるはずだが念のため)
+		// QuickMode のマーカーがあれば削除
+		if quickModeOriginMarker != "" {
+			_ = os.Remove(quickModeOriginMarker)
+		}
 		return fmt.Errorf("エンコーダ (-hwenc または -cpuenc) が指定されていません。")
 	}
 
@@ -475,11 +521,19 @@ encodeFailure: // --- エンコード失敗時の後処理 ---
 			// その他の失敗 (タイムアウト含む)
 			markerSuffix = ".failed"
 		}
-		markerPath := outputFile + markerSuffix // 最終出力ファイルパスにサフィックスを追加
-		createMarkerFile(markerPath, markerContent)
+		// 失敗マーカーは最終出力ファイルパス基準で作成
+		failMarkerPath := outputFile + markerSuffix
+		createMarkerFile(failMarkerPath, markerContent)
+
+		// QuickMode の .origin マーカーがあれば削除 (失敗したので回復処理は不要)
+		if quickModeOriginMarker != "" {
+			debugLogPrintf("エンコード失敗のため .origin マーカー削除: %s", quickModeOriginMarker)
+			_ = os.Remove(quickModeOriginMarker)
+		}
 
 		// 失敗時のクリーンアップ処理 (fileutils.go)
 		// QuickMode かどうかで処理内容が変わる
+		// handleProcessingFailure は ffmpegResult.err を返すか、独自のメッセージを生成する
 		return handleProcessingFailure(inputFile, outputFile, result, quickModeFlag, renamedSourcePath, tempOutputPath)
 	}
 
@@ -513,13 +567,24 @@ encodeSuccess: // --- エンコード成功時の後処理 ---
 
 	} else {
 		// === Quick モード成功時 ===
-		// リネームしていたソースファイルを元の名前に戻す
-		debugLogPrintf("Quick Mode: 処理中ファイル名を元に戻します: %s -> %s", renamedSourcePath, inputFile)
+		// 1. .origin マーカーファイルを削除
+		if quickModeOriginMarker != "" {
+			debugLogPrintf("Quick Mode 成功: .origin マーカー削除: %s", quickModeOriginMarker)
+			if err := os.Remove(quickModeOriginMarker); err != nil {
+				// マーカー削除失敗は警告ログに留める
+				logger.Printf("警告 [Quick Mode]: .origin マーカー削除失敗 (%s): %v", quickModeOriginMarker, err)
+			}
+		}
+
+		// 2. リネームしていたソースファイルを元の名前に戻す
+		debugLogPrintf("Quick Mode 成功: 処理中ファイル名を元に戻します: %s -> %s", renamedSourcePath, inputFile)
 		if err := os.Rename(renamedSourcePath, inputFile); err != nil {
-			// リネームバック失敗は警告ログに留める
-			logger.Printf("警告 [Quick Mode]: ソースのリネームバック失敗 (%s -> %s): %v", renamedSourcePath, inputFile, err)
-			logger.Printf("  手動で '%s' を '%s' に戻してください。", renamedSourcePath, inputFile)
-			// 処理自体は成功しているのでエラーは返さない
+			// ★★★ リネームバック失敗は致命的なエラーとして扱う ★★★
+			errMsg := fmt.Sprintf("Quick Mode リネームバック失敗 (%s -> %s): %w", renamedSourcePath, inputFile, err)
+			logger.Printf("エラー [Quick Mode]: %s", errMsg)
+			logger.Printf("  手動で '%s' を '%s' に戻し、出力ファイル '%s' を確認してください。", renamedSourcePath, inputFile, outputFile)
+			// 失敗を示すエラーを返す
+			return fmt.Errorf(errMsg)
 		}
 		// Quick モードでは ffmpeg が直接 outputFile に出力しているので、移動は不要。
 	}

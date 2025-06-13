@@ -161,7 +161,26 @@ namespace TransAV1
         private void rbEncoder_CheckedChanged(object sender, EventArgs e) => UpdateCustomEncoderTextBoxState();
         private void UpdateCustomEncoderTextBoxState() { try { if (this.IsDisposed) return; customEncoderTextBox.Enabled = rbEncoderCustom.Checked && runButton.Enabled; } catch { /* ignore */ } }
         private void cbShowLog_CheckedChanged(object sender, EventArgs e) => UpdateLogRichTextBoxVisibility();
-        private void UpdateLogRichTextBoxVisibility() { try { if (this.IsDisposed) return; bool visible = cbShowLog.Checked; logRichTextBox.Visible = visible; logLabel.Visible = visible; } catch { /* ignore */ } }
+
+        // UpdateLogRichTextBoxVisibility メソッド (logLabel への参照を削除済み)
+        private void UpdateLogRichTextBoxVisibility()
+        {
+            try
+            {
+                if (this.IsDisposed) return;
+                bool visible = cbShowLog.Checked;
+                logRichTextBox.Visible = visible;
+                // logLabel.Visible = visible; // <- この行は削除済み
+            }
+            catch (Exception ex)
+            {
+                // エラー処理が必要な場合はここに追加 (例: Debug.WriteLine)
+                // 通常、フォーム破棄時の例外は無視して問題ないことが多い
+                /* ignore */
+                Debug.WriteLine($"Error in UpdateLogRichTextBoxVisibility: {ex.Message}"); // デバッグ用にログ出力
+            }
+        }
+
 
         private void SetControlsState(bool isRunning)
         {
@@ -387,8 +406,9 @@ namespace TransAV1
 
                 try
                 {
-                    LogToBuffer("プロセスの終了を最大 1 秒間待機します..."); FlushLogBuffer(); // AppendLog -> LogToBuffer
-                    await Task.Delay(1000);
+                    // ★★★ 修正点: 待機時間を 10 秒に変更 ★★★
+                    LogToBuffer("プロセスの終了を最大 10 秒間待機します..."); FlushLogBuffer(); // AppendLog -> LogToBuffer
+                    await Task.Delay(10000); // 1000ms -> 10000ms
 
                     lock (_processLock) { currentProcess = _transAV1Process; }
                     if (currentProcess != null && !currentProcess.HasExited && currentProcess == processToStop)

@@ -16,3 +16,13 @@ D:\My Data\Develop\Project TransAV1\WIndowsGUI\obj\Debug\TransAV1.csproj.CoreCom
 D:\My Data\Develop\Project TransAV1\WIndowsGUI\obj\Debug\TransAV1.exe
 D:\My Data\Develop\Project TransAV1\WIndowsGUI\obj\Debug\TransAV1.pdb
 D:\My Data\Develop\Project TransAV1\WIndowsGUI\bin\Debug\TransAV1.pdb
+D:\My Data\Develop\Git\Project TransAV1\WIndowsGUI\bin\Debug\TransAV1.exe.config
+D:\My Data\Develop\Git\Project TransAV1\WIndowsGUI\bin\Debug\TransAV1.exe
+D:\My Data\Develop\Git\Project TransAV1\WIndowsGUI\bin\Debug\TransAV1.pdb
+D:\My Data\Develop\Git\Project TransAV1\WIndowsGUI\obj\Debug\TransAV1.csproj.AssemblyReference.cache
+D:\My Data\Develop\Git\Project TransAV1\WIndowsGUI\obj\Debug\TransAV1.Form1.resources
+D:\My Data\Develop\Git\Project TransAV1\WIndowsGUI\obj\Debug\TransAV1.Properties.Resources.resources
+D:\My Data\Develop\Git\Project TransAV1\WIndowsGUI\obj\Debug\TransAV1.csproj.GenerateResource.cache
+D:\My Data\Develop\Git\Project TransAV1\WIndowsGUI\obj\Debug\TransAV1.csproj.CoreCompileInputs.cache
+D:\My Data\Develop\Git\Project TransAV1\WIndowsGUI\obj\Debug\TransAV1.exe
+D:\My Data\Develop\Git\Project TransAV1\WIndowsGUI\obj\Debug\TransAV1.pdb

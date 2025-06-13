@@ -5,8 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
-
-	// "log" // log パッケージは logutils.go でのみ使用
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +23,7 @@ const (
 	defaultCpuOpt    = "-crf 28 -preset 7"
 	defaultTimeout   = 7200
 	tempDirPrefix    = "go_transav1_" // 一時ディレクトリ名の接頭辞
+	originSuffix     = ".origin"      // QuickMode 回復用マーカーのサフィックス
 )
 
 // --- グローバル変数 ---
@@ -43,7 +42,7 @@ var (
 
 	// 動作モード関連フラグ
 	logToFile         bool   // ログをファイルにも書き出すか
-	debugMode         bool   // デバッグログを有効にするか (logutils.goからも参照される)
+	debugMode         bool   // デバッグログを有効にするか
 	restart           bool   // 再開モード (マーカー/0バイトファイル削除)
 	forceStart        bool   // 出力ディレクトリ強制削除モード
 	quickModeFlag     bool   // 一時コピーなしの高速モード
@@ -82,9 +81,11 @@ func printUsage() {
     - 音声は AAC に変換されます。
     - 出力ファイル名は元の名前に「%s」が付与されます (例: input.mp4 -> input_AV1.mp4)。
   - その他のファイル (画像 %s など) はそのまま出力先の対応するサブディレクトリにコピーされます。
+    【重要】ディレクトリモードでは、その他のファイルのコピーは動画エンコード処理 *前* に実行されます。
   - 通常、エンコード処理は一時ディレクトリで行われます (-quick 指定時を除く)。
   - ffmpeg/ffprobe は -ffmpegdir で指定されたディレクトリ、または環境変数PATHから検索されます。
   - ffmpeg プロセスは指定された優先度で実行されます (Windows: SetPriorityClass, Linux/macOS: nice)。
+  - QuickMode (-quick) で中断された場合、次回起動時に回復処理が試行されます。
 
 必須引数:
 `, progName, progName, getVideoExtList(), outputSuffix, getImageExtList()) // fileutils.go の関数を呼び出し
@@ -101,7 +102,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  -hwopt \"<オプション>\"\n\tHWエンコーダ用の追加ffmpegオプション (引用符で囲む)。\n\t(デフォルト: \"%s\")\n", defaultHwOpt)    // パッケージレベル定数を使用
 	fmt.Fprintf(os.Stderr, "  -cpuopt \"<オプション>\"\n\tCPUエンコーダ用の追加ffmpegオプション (引用符で囲む)。\n\t(デフォルト: \"%s\")\n", defaultCpuOpt) // パッケージレベル定数を使用
 	fmt.Fprintf(os.Stderr, "  -timeout <秒>\n\tffmpeg 各処理のタイムアウト秒数 (0で無効)。\n\t(デフォルト: %d)\n", defaultTimeout)                 // パッケージレベル定数を使用
-	fmt.Fprintf(os.Stderr, "  -quick\n\t高速モード: 一時コピーを行わず入力元ファイルを直接エンコード (非推奨)。\n\t処理失敗時に元ファイルが破損するリスクがあります。\n\t(デフォルト: false)\n")
+	fmt.Fprintf(os.Stderr, "  -quick\n\t高速モード: 一時コピーを行わず入力元ファイルを直接エンコード。\n\t処理失敗時に元ファイルが破損するリスクがあります。\n\t次回起動時に回復処理が試行されます。\n\t(デフォルト: false)\n")
 	fmt.Fprintf(os.Stderr, "  -usetemp\n\t多数の動画ファイルを処理する場合に一時ファイルリストを使用します。\n\tメモリ使用量を抑えられますが、ディスクI/Oが増加します。\n\t(デフォルト: false - メモリ内リストを使用)\n")
 	fmt.Fprintf(os.Stderr, "  -log\n\tログを出力ディレクトリ内のファイル (GoTransAV1_Log_*.log) にも書き出します。\n\t(デフォルト: false)\n")
 	fmt.Fprintf(os.Stderr, "  -debug\n\t詳細なデバッグログ (ffmpegの出力など) を有効にします。\n\t(デフォルト: false)\n")
@@ -117,7 +118,86 @@ func printUsage() {
     エンコーダ名は ffmpeg -encoders で確認できます。
   - -force オプションは出力先を完全に削除するため、実行前に確認メッセージが表示されます。
   - -quick モードは処理中に問題が発生した場合、入力ファイルが不完全な状態になる可能性があります。
+    次回起動時に回復処理が試行されますが、手動での確認が必要になる場合があります。
 `)
+}
+
+// --- recoverQuickModeFiles 関数: QuickMode で中断された可能性のあるファイルを回復試行 ---
+func recoverQuickModeFiles(srcRoot, dstRoot string) {
+	logger.Println("--- QuickMode 回復処理開始 ---")
+	recoveredCount := 0
+	failedCount := 0
+
+	walkErr := filepath.WalkDir(dstRoot, func(markerPath string, d fs.DirEntry, err error) error {
+		if err != nil {
+			logger.Printf("警告 [QuickMode回復]: ディレクトリ/ファイル '%s' へのアクセスエラー: %v。スキップします。", markerPath, err)
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// ディレクトリや .origin 以外のファイルは無視
+		if d.IsDir() || !strings.HasSuffix(d.Name(), originSuffix) {
+			return nil
+		}
+
+		// .origin ファイルが見つかった
+		debugLogPrintf("[QuickMode回復]: マーカー発見: %s", markerPath)
+
+		// 1. 元のファイル名と相対パスを取得
+		originalBaseName := strings.TrimSuffix(d.Name(), originSuffix)
+		relPath, err := filepath.Rel(dstRoot, filepath.Dir(markerPath))
+		if err != nil {
+			logger.Printf("警告 [QuickMode回復]: マーカー '%s' の相対パス計算失敗: %v。回復スキップ。", markerPath, err)
+			return nil // このマーカーは処理できない
+		}
+
+		// 2. 対応するソースファイルパスを構築
+		originalSourcePath := filepath.Join(srcRoot, relPath, originalBaseName)
+		processingSourcePath := originalSourcePath + ".processing"
+
+		debugLogPrintf("[QuickMode回復]: 対応ソース確認: '%s' (処理中名: '%s')", originalSourcePath, processingSourcePath)
+
+		// 3. .processing ファイルが存在するか確認
+		if _, err := os.Stat(processingSourcePath); os.IsNotExist(err) {
+			// .processing が存在しない -> 正常終了済みか、マーカーだけ残った異常状態
+			logger.Printf("情報 [QuickMode回復]: 対応する処理中ファイル '%s' が見つかりません。マーカー '%s' を削除します。", filepath.Base(processingSourcePath), filepath.Base(markerPath))
+			if errDel := os.Remove(markerPath); errDel != nil {
+				logger.Printf("警告 [QuickMode回復]: マーカー削除失敗 (%s): %v", markerPath, errDel)
+			}
+			return nil // 次のファイルへ
+		} else if err != nil {
+			// Stat で他のエラー
+			logger.Printf("警告 [QuickMode回復]: 処理中ファイル '%s' の状態確認エラー: %v。回復スキップ。", processingSourcePath, err)
+			return nil
+		}
+
+		// 4. .processing ファイルを元の名前にリネーム試行
+		logger.Printf("情報 [QuickMode回復]: 処理中ファイル '%s' を '%s' にリネーム試行...", filepath.Base(processingSourcePath), filepath.Base(originalSourcePath))
+		if err := os.Rename(processingSourcePath, originalSourcePath); err != nil {
+			logger.Printf("エラー [QuickMode回復]: リネーム失敗 (%s -> %s): %v。手動での確認が必要です！", filepath.Base(processingSourcePath), filepath.Base(originalSourcePath), err)
+			failedCount++
+		} else {
+			// 5. リネーム成功 -> マーカーファイルを削除
+			logger.Printf("成功 [QuickMode回復]: リネーム完了。マーカー '%s' を削除します。", filepath.Base(markerPath))
+			if errDel := os.Remove(markerPath); errDel != nil {
+				logger.Printf("警告 [QuickMode回復]: リネーム成功後、マーカー削除失敗 (%s): %v", markerPath, errDel)
+				// リネームは成功したので recoveredCount は増やす
+			}
+			recoveredCount++
+		}
+		return nil // 次のファイルへ
+	})
+
+	if walkErr != nil {
+		logger.Printf("警告 [QuickMode回復]: ディレクトリ走査中に予期せぬエラー: %v", walkErr)
+	}
+
+	if recoveredCount > 0 || failedCount > 0 {
+		logger.Printf("--- QuickMode 回復処理終了 (成功: %d件, 要確認: %d件) ---", recoveredCount, failedCount)
+	} else {
+		logger.Println("--- QuickMode 回復処理終了 (対象ファイルなし) ---")
+	}
 }
 
 // --- main 関数 ---
@@ -153,9 +233,8 @@ func main() {
 	flag.Parse()
 
 	// --- ロギング設定 ---
-	// logutils.go の setupLogging を呼び出し
-	// setupLogging はグローバル変数 debugMode を参照してデバッグロガーを設定する
-	setupLogging(destDir, startTime, logToFile, debugMode) // debugMode を引数で渡す必要はなくなった
+	// logutils.go の setupLogging を呼び出し (debugMode を引数で渡す)
+	setupLogging(destDir, startTime, logToFile, debugMode)
 
 	// --- 必須引数のチェック ---
 	if sourceDir == "" || destDir == "" {
@@ -227,8 +306,10 @@ func main() {
 
 	// --- 出力先の検証と準備 ---
 	destInfo, err := os.Stat(destDir)
+	destExists := true
 	if err != nil {
 		if os.IsNotExist(err) {
+			destExists = false // ディレクトリが存在しない
 			if isSingleFileMode {
 				logger.Fatalf("エラー: 単一ファイルモード(-s でファイルを指定)では、出力先ディレクトリ '%s' が事前に存在する必要があります。", destDir)
 			} else {
@@ -245,7 +326,7 @@ func main() {
 	if forceStart {
 		if isSingleFileMode {
 			logger.Println("警告: 単一ファイルモードでは -force オプションは無視されます。")
-		} else {
+		} else if destExists { // 存在するディレクトリに対してのみ実行
 			logger.Printf("!!! 警告: -force オプションが指定されました。出力ディレクトリ '%s' を完全に削除します。", destDir)
 			fmt.Print("本当に実行しますか？ (yes/no): ")
 			reader := bufio.NewReader(os.Stdin)
@@ -261,26 +342,39 @@ func main() {
 					logger.Fatalf("エラー: 出力ディレクトリ削除失敗: %v", err)
 				}
 				logger.Println("出力ディレクトリを削除しました。")
+				destExists = false // 削除したので存在しない状態に
 			} else {
 				logger.Println("削除をキャンセルしました。処理を中断します。")
 				os.Exit(0)
 			}
+		} else {
+			logger.Println("情報: -force オプションが指定されましたが、出力ディレクトリが存在しないためスキップします。")
 		}
 	}
 
-	// --- 出力ディレクトリ作成 ---
-	if err := os.MkdirAll(destDir, 0755); err != nil {
-		logger.Fatalf("エラー: 出力ディレクトリ '%s' の作成に失敗: %v", destDir, err)
+	// --- 出力ディレクトリ作成 (存在しない場合 or forceで削除された場合) ---
+	if !destExists {
+		if err := os.MkdirAll(destDir, 0755); err != nil {
+			logger.Fatalf("エラー: 出力ディレクトリ '%s' の作成に失敗: %v", destDir, err)
+		}
+		destExists = true // 作成したので存在する
 	}
 
-	// --- -restart オプション処理 ---
+	// --- QuickMode 回復処理 (ディレクトリモードかつ出力先が存在する場合) ---
+	if !isSingleFileMode && destExists {
+		recoverQuickModeFiles(sourceDir, destDir)
+	}
+
+	// --- -restart オプション処理 (ディレクトリモードかつ出力先が存在する場合) ---
 	if restart {
 		if isSingleFileMode {
 			logger.Println("警告: 単一ファイルモードでは -restart オプションは無視されます。")
-		} else {
+		} else if destExists {
 			if err := removeRestartFiles(destDir); err != nil {
 				logger.Fatalf("エラー: -restart 処理中にエラーが発生: %v", err)
 			}
+		} else {
+			logger.Println("情報: -restart オプションが指定されましたが、出力ディレクトリが存在しないためスキップします。")
 		}
 	}
 
@@ -317,7 +411,9 @@ func main() {
 
 		logger.Printf("処理対象: %s -> %s", inputFile, outputFile)
 
-		if err := processVideoFile(inputFile, outputFile, tempDir, ffmpegPriority, hwEncoder, cpuEncoder, hwEncoderOptions, cpuEncoderOptions, timeoutSeconds, quickModeFlag); err != nil {
+		// processVideoFile に outputDir を渡すように変更 (QuickModeマーカー作成のため)
+		outputDir := filepath.Dir(outputFile)
+		if err := processVideoFile(inputFile, outputFile, outputDir, tempDir, ffmpegPriority, hwEncoder, cpuEncoder, hwEncoderOptions, cpuEncoderOptions, timeoutSeconds, quickModeFlag); err != nil {
 			allErrors = append(allErrors, fmt.Sprintf("%s: %v", inputFilename, err))
 		}
 		logger.Println("--- 単一ファイル処理モード終了 ---")
@@ -340,6 +436,8 @@ func main() {
 				return nil
 			}
 			if d.IsDir() {
+				// ディレクトリ自体はリストに追加しないが、QuickMode回復処理のために存在は確認する
+				// 回復処理は WalkDir の前に行ったので、ここでは何もしない
 				return nil
 			}
 			fileCount++
@@ -379,7 +477,7 @@ func main() {
 						break
 					}
 				}
-				if usingTempFileList {
+				if usingTempFileList { // エラーなくループを終えた場合のみ
 					if err := writer.Flush(); err != nil {
 						file.Close()
 						logger.Printf("警告: 一時リストフラッシュ失敗 (%s): %v。メモリ上のリストを使用します。", tempFileListPath, err)
@@ -390,15 +488,19 @@ func main() {
 						usingTempFileList = false
 						_ = os.Remove(tempFileListPath)
 					} else {
-						videoFiles = nil
+						videoFiles = nil // メモリ上のリストは不要に
 						logger.Printf("一時リスト書き込み完了。")
 					}
+				} else { // ループ中にエラーが発生した場合
+					file.Close()                    // ファイルは閉じる
+					_ = os.Remove(tempFileListPath) // 作成した一時ファイルは削除
 				}
 			}
 		} else if usingTempFileList && len(videoFiles) == 0 {
 			logger.Println("-usetemp 指定ですが、処理対象の動画ファイルがないため一時リストは作成しません。")
 			usingTempFileList = false
-		} else {
+		} else if !usingTempFileList {
+			// usingTempFileList が false の場合のログ (デフォルト)
 			logger.Printf("メモリ上のリストを使用します (-usetemp 未指定または動画なし)。")
 		}
 
@@ -417,8 +519,8 @@ func main() {
 					continue
 				}
 				otherOutputPath := filepath.Join(destDir, relPath)
-				logger.Printf("コピー中 (%d/%d): %s", i+1, otherCount, filepath.Base(otherFile))
-				// ★★★ 修正点: copyImageFile -> copyOtherFile ★★★
+				// コピー前にログ出力
+				logger.Printf("コピー中 (%d/%d): %s -> %s", i+1, otherCount, filepath.Base(otherFile), otherOutputPath)
 				if err := copyOtherFile(otherFile, otherOutputPath); err != nil {
 					// copyOtherFile 内でスキップログは出さないので、エラーのみ記録
 					errMsg := fmt.Sprintf("その他ファイルコピー失敗(%s): %v", filepath.Base(otherFile), err)
@@ -444,6 +546,7 @@ func main() {
 			defer file.Close()
 			scanner := bufio.NewScanner(file)
 			videoIndex := 0
+			// Note: 一時リスト使用時は総数が不明なため、(index/不明) と表示
 			for scanner.Scan() {
 				videoIndex++
 				filePath := strings.TrimSpace(scanner.Text())
@@ -458,7 +561,9 @@ func main() {
 					videoProcessingErrors = append(videoProcessingErrors, errMsg)
 					continue
 				}
-				if err := processVideoFile(filePath, outputPath, tempDir, ffmpegPriority, hwEncoder, cpuEncoder, hwEncoderOptions, cpuEncoderOptions, timeoutSeconds, quickModeFlag); err != nil {
+				// processVideoFile に outputDir を渡す
+				outputDir := filepath.Dir(outputPath)
+				if err := processVideoFile(filePath, outputPath, outputDir, tempDir, ffmpegPriority, hwEncoder, cpuEncoder, hwEncoderOptions, cpuEncoderOptions, timeoutSeconds, quickModeFlag); err != nil {
 					videoProcessingErrors = append(videoProcessingErrors, fmt.Sprintf("%s: %v", filepath.Base(filePath), err))
 				}
 			}
@@ -466,7 +571,7 @@ func main() {
 				logger.Printf("エラー: 一時リストのスキャン中にエラーが発生: %v", err)
 				videoProcessingErrors = append(videoProcessingErrors, fmt.Sprintf("一時リストスキャンエラー: %v", err))
 			}
-		} else {
+		} else { // メモリ上のリストを使用
 			videoCount := len(videoFiles)
 			if videoCount > 0 {
 				logger.Printf("メモリ上のリストから %d 件の動画を処理します。", videoCount)
@@ -479,7 +584,9 @@ func main() {
 						videoProcessingErrors = append(videoProcessingErrors, errMsg)
 						continue
 					}
-					if err := processVideoFile(vidFile, outputPath, tempDir, ffmpegPriority, hwEncoder, cpuEncoder, hwEncoderOptions, cpuEncoderOptions, timeoutSeconds, quickModeFlag); err != nil {
+					// processVideoFile に outputDir を渡す
+					outputDir := filepath.Dir(outputPath)
+					if err := processVideoFile(vidFile, outputPath, outputDir, tempDir, ffmpegPriority, hwEncoder, cpuEncoder, hwEncoderOptions, cpuEncoderOptions, timeoutSeconds, quickModeFlag); err != nil {
 						videoProcessingErrors = append(videoProcessingErrors, fmt.Sprintf("%s: %v", filepath.Base(vidFile), err))
 					}
 				}
