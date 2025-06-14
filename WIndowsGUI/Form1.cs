@@ -126,7 +126,7 @@ namespace TransAV1
             catch (Exception ex)
             {
                 LogToBuffer($"エラー: INI読み込み例外: {ex.Message}"); // AppendLog -> LogToBuffer
-                MessageBox.Show($"設定ファイル ({_iniFileName}) 読み込みエラー。\nデフォルト設定で起動します。\n\n詳細: {ex.Message}", "設定読み込みエラー", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show($"設定ファイル ({_iniFileName}) 読み込みエラー。\nデフォルト設定で起動します。\n\n詳細: {ex.Message}", "設定読み込みエラー", MessageBoxButtons.OK, MessageBoxIcon.None);
             }
             finally
             {
@@ -217,7 +217,7 @@ namespace TransAV1
             if (!string.IsNullOrWhiteSpace(ffmpegDirTextBox.Text) && !Directory.Exists(ffmpegDirTextBox.Text)) { MessageBox.Show("指定された ffmpeg ディレクトリが存在しません。", "警告", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
             // --- /入力検証 ---
 
-            if (MessageBox.Show("TransAV1 の変換処理を開始しますか？", "実行確認", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.No) return;
+            if (MessageBox.Show("TransAV1 の変換処理を開始しますか？", "実行確認", MessageBoxButtons.YesNo, MessageBoxIcon.None) == DialogResult.No) return;
 
             logRichTextBox.Clear();
             lock (_logBufferLock) { _logBuffer.Clear(); } // バッファもクリア
@@ -391,7 +391,7 @@ namespace TransAV1
                 LogToBuffer("TransAV1 プロセスは実行されていません。"); FlushLogBuffer(); SetControlsState(false); return; // AppendLog -> LogToBuffer
             }
 
-            if (MessageBox.Show("TransAV1 処理を強制停止しますか？\n(ファイルの破損等の可能性があります)", "強制停止確認", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.No) return;
+            if (MessageBox.Show("TransAV1 処理を強制停止しますか？\n(ファイルの破損等の可能性があります)", "強制停止確認", MessageBoxButtons.YesNo, MessageBoxIcon.None) == DialogResult.No) return;
 
             LogToBuffer("プロセス停止を試みます..."); FlushLogBuffer(); // AppendLog -> LogToBuffer
             try { if (!this.IsDisposed) rbModeRestart.Checked = true; } catch { /* ignore */ } // 再開チェック
@@ -453,7 +453,7 @@ namespace TransAV1
                 if (!processHasExited)
                 {
                     LogToBuffer("実行中のプロセスがあります。終了確認を行います。"); FlushLogBuffer(); // AppendLog -> LogToBuffer
-                    DialogResult confirmResult = MessageBox.Show("TransAV1 処理が実行中です。\nフォームを閉じると処理は中断されます。\n閉じてもよろしいですか？", "終了確認", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                    DialogResult confirmResult = MessageBox.Show("TransAV1 処理が実行中です。\nフォームを閉じると処理は中断されます。\n閉じてもよろしいですか？", "終了確認", MessageBoxButtons.YesNo, MessageBoxIcon.None);
 
                     if (confirmResult == DialogResult.No)
                     {
